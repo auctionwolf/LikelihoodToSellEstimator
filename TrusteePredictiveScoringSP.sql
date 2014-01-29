@@ -1,7 +1,7 @@
 USE [PredictiveData]
 GO
 
-/****** Object:  StoredProcedure [dbo].[DataScience_TrusteePredictionData]    Script Date: 1/17/2014 10:46:54 AM ******/
+/****** Object:  StoredProcedure [dbo].[DataScience_TrusteePredictionData]    Script Date: 1/29/2014 8:11:38 AM ******/
 SET ANSI_NULLS ON
 GO
 
@@ -11,16 +11,40 @@ GO
 
 
 
+
 -- =============================================
 -- Author:		Wolf Rendall, wrendall@auction.com
 -- Create date: 2014-01-06
--- Last Edit:	2014-01-15
+-- Edit:		2014-01-15
+-- Last Edit:	2014-01-29
 -- Description:	Final Table for Trustee Asset Prediction
 -- =============================================
 CREATE PROCEDURE [dbo].[DataScience_TrusteePredictionData] 
 
 AS
 BEGIN
+--Declare Variables
+        DeclareVariables:    
+        DECLARE @5MonthsToToday DATETIME ,
+            @3MonthsToToday DATETIME ,
+            @Today DATETIME ,
+            @ALRInceptionDate DATETIME ,
+            @BPOReserveRatio DECIMAL ,
+            @BPOAbsurdityLowerBound DECIMAL ,
+            @ZIPPopulationDefault DECIMAL ,
+            @ZIPVacancyRateDefault DECIMAL,
+			@BPOReserveSurplusDefault DECIMAL
+
+        SET @Today = {T '00:00:00'}
+        SET @5MonthsToToday = DATEADD(MONTH, -5, @Today)
+        SET @3MonthsToToday = DATEADD(MONTH, -3, @Today)
+        SET @ALRInceptionDate = '2013-07-01'
+        SET @BPOReserveRatio = 1.2
+		SET @BPOReserveSurplusDefault = 0.2
+        SET @BPOAbsurdityLowerBound = 0.15
+        SET @ZIPPopulationDefault = 8000
+        SET @ZIPVacancyRateDefault = 0.087
+
 -- SET NOCOUNT ON added to prevent extra result sets from
 -- interfering with SELECT statements.
 	SET NOCOUNT ON;
@@ -29,30 +53,76 @@ BEGIN
 
 --Date range is 3 months prior
 --Start by creating temporary tables and finish with one pull at the end
-
+        IF OBJECT_ID('tempdb..#TemporaryFactTrusteeAuction') IS NOT NULL
+            BEGIN
+                DROP TABLE #TemporaryFactTrusteeAuction
+            END
+        IF OBJECT_ID('tempdb..#BroughtToSaleHistory') IS NOT NULL
+            BEGIN
+                DROP TABLE #BroughtToSaleHistory;
+            END
+        IF OBJECT_ID('tempdb..#Favorites') IS NOT NULL
+            BEGIN
+                DROP TABLE #Favorites;
+            END
+        IF OBJECT_ID('tempdb..#ADCExecution') IS NOT NULL
+            BEGIN
+                DROP TABLE #ADCExecution;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePortfolioQuality') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePortfolioQuality;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePredictionPreOutput') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePredictionPreOutput;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePredictionSourceTable') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePredictionSourceTable;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePredictionOutput_Auto') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePredictionOutput_Auto;
+            END
+        IF OBJECT_ID('tempdb..#TrusteeNegativeFactors') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteeNegativeFactors;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePropertyFaultPreOutput') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePropertyFaultPreOutput;
+            END
 
 
 --Start with FactTrusteeAuction as a base, but trim down the result set and add in an index to join on
 SELECT
 A.*
-, CAST(CONCAT(Year(A.AuctionDate), '-', Month(A.AuctionDate), '-', '01') AS DATE) AS ZillowJoinField
-, Year(A.AuctionDate)*100 + Month(A.AuctionDate) AS USPSJoinField
+,FORMAT(A.AuctionDate, 'yyyy-MM-01') AS ZillowJoinField
+,FORMAT(A.AuctionDate, 'yyyyMM') AS USPSJoinField
 INTO
 #TemporaryFactTrusteeAuction
 FROM
 EDW.DBO.FactTrusteeAuction A
-WHERE	A.AuctionDate >= DATEADD(MONTH, (-3), CURRENT_TIMESTAMP)
+LEFT JOIN	EDW.dbo.DimAuction DA	ON( DA.AuctionId = A.AuctionId)
+WHERE	A.AuctionDate >= @5MonthsToToday
 AND		A.AuctionDate IS NOT NULL
-Order By AuctionDate 
+AND		DA.IsTest = 0
+AND		DA.IsDemo = 0
+ORDER BY AuctionDate 
 
+CREATE CLUSTERED INDEX ZillowJoinField ON #TemporaryFactTrusteeAuction (ZillowJoinField);
 CREATE NONCLUSTERED INDEX PropertyId ON #TemporaryFactTrusteeAuction (PropertyId); 
 CREATE NONCLUSTERED INDEX VenueId ON #TemporaryFactTrusteeAuction (VenueId); 
 CREATE NONCLUSTERED INDEX AuctionId ON #TemporaryFactTrusteeAuction (AuctionId); 
-CREATE CLUSTERED INDEX ZillowJoinField ON #TemporaryFactTrusteeAuction (ZillowJoinField);
 CREATE NONCLUSTERED INDEX USPSJoinField ON #TemporaryFactTrusteeAuction (USPSJoinField);
 
-
---Historical Sell Through Rate Data (Auction.com Execution)
+        AuctionExecution:
+--========================================================================================================================
+-- Historical Sell Through Rate Data (Auction.com Execution)
+-- We use this as a measure of which ZIP codes we are strong in, and which we are weak in
+-- Assets coming to us in an area where we have an established buyer pool should do better than those we don't
+--========================================================================================================================
 SELECT
 DP.PropertyState
 ,DP.PropertyZip
@@ -62,14 +132,10 @@ DP.PropertyState
 INTO
 #ADCExecution
 
-FROM		EDW.dbo.FactTrusteeAuction				FTA
+FROM		#TemporaryFactTrusteeAuction					FTA
 LEFT JOIN	EDW.dbo.DimProperty						DP	ON( DP.PropertyId = FTA.PropertyId)
-LEFT JOIN	EDW.dbo.DimAuction						DA	ON( DA.AuctionId = FTA.AuctionId)
 
-WHERE	DA.IsTest = 0
-AND		DA.IsDemo = 0
-AND		FTA.AuctionDate >= DATEADD(MONTH, (-5), CURRENT_TIMESTAMP)
-AND		FTA.AuctionDate <= CURRENT_TIMESTAMP
+WHERE	FTA.AuctionDate <= CURRENT_TIMESTAMP
 AND		FTA.AuctionDate IS NOT NULL
 AND		FTA.IsAuction = 1
 
@@ -84,10 +150,13 @@ ORDER BY
 DP.PropertyState
 ,DP.PropertyZip
 
-
-
-
---Historical Seller (Trustee) Portfolio Quality Data
+        SellerPortfolioQuality:
+--========================================================================================================================
+-- Historical Seller (Trustee) Portfolio Quality Data
+-- We use this as a measure of which Seller Product Lines (Not Auction.com Product Lines, but a particular
+-- group within a seller organization managing a certain class of assets) are strong performers
+-- Assets coming to us from sellers with historically good portfolios should do better than those that don't
+--========================================================================================================================
 select
 DT.TrusteeCode
 ,AVG(CAST(FTA.IsSold AS DECIMAL)) AS AvgSTR
@@ -96,15 +165,12 @@ DT.TrusteeCode
 INTO
 #TrusteePortfolioQuality
 
-FROM		EDW.dbo.FactTrusteeAuction				FTA
+FROM		#TemporaryFactTrusteeAuction			FTA
 LEFT JOIN	EDW.dbo.DimProperty						DP	ON( DP.PropertyId = FTA.PropertyId)
-LEFT JOIN	EDW.dbo.DimAuction						DA	ON( DA.AuctionId = FTA.AuctionId)
 LEFT JOIN	EDW.dbo.DimTrustee						DT	ON(DT.TrusteeId = FTA.TrusteeId)
 
 
-WHERE	DA.IsTest = 0
-AND		DA.IsDemo = 0
-AND		FTA.AuctionDate >= DATEADD(MONTH, (-5), CURRENT_TIMESTAMP)
+WHERE	FTA.AuctionDate >= @5MonthsToToday
 AND		FTA.AuctionDate <= CURRENT_TIMESTAMP
 AND		FTA.AuctionDate IS NOT NULL
 AND		FTA.IsAuction = 1
@@ -118,8 +184,12 @@ COUNT(FTA.IsAuction) >= 5
 ORDER BY
 DT.TrusteeCode
 
-
---Property Historical Brought To Sale Outcomes (Indicates likelihood of Add'l postponement or cancelation
+		PropertyBroughtToSaleHistory:
+--========================================================================================================================
+-- Property Historical Brought To Sale Outcomes (Indicates likelihood of Add'l postponement or cancelation
+-- The Model makes predictions on likelihood to be postponed and likelihood to be cancelled
+-- One of the largest indicators is previous cancellations, we use the following table to capture that value
+--========================================================================================================================
 SELECT
 PropertyId
 ,SUM(IsAuction) + SUM(IsRemoved) + SUM(IsCancelled) + SUM(IsPostponed) AS RunNum
@@ -133,11 +203,14 @@ EDW.DBO.FactTrusteeAuction
 GROUP BY
 PropertyId
 
-
-
---Get Favorites
+        PropertyFavorites:
+--========================================================================================================================
+-- Property Favorites Data
+-- For each run of each asset (which we take as favorites per property per auctionid -- maps to AuctionCode)
+--========================================================================================================================
 SELECT
 PropertyId
+,AuctionId
 ,COUNT(distinct(UserId)) AS Favorites
 
 INTO
@@ -148,17 +221,17 @@ EDW.dbo.FactPropertyFavorites
 
 GROUP BY
 propertyId
+,AuctionId
 
 ORDER BY
 propertyId
 
 
-
-
---And now we unite all of this and the major auction information tables into a complete predictive set
-
-
-
+        PredictionDataCollectionAndUnificationTable:
+--========================================================================================================================
+-- Building the Base Information Set
+-- And now we unite all of this and the major auction information tables into a complete predictive set
+--========================================================================================================================
 SELECT
 --Descriptive Information
 DP.GlobalPropertyId
@@ -189,7 +262,6 @@ DP.GlobalPropertyId
 ,CASE WHEN(DP.ProductType LIKE '%REO%') THEN 1 ELSE 0 END AS REO_Flag
 ,CASE WHEN(DP.ProductType LIKE '%Short Sale%') THEN 1 ELSE 0 END AS ShortSale_Flag
 ,CASE WHEN(DP.ProductType LIKE '%Trustee%') THEN 1 ELSE 0 END AS Trustee_Flag
-
 
 --Win Criteria
 ,FTA.IsSold
@@ -242,7 +314,6 @@ DP.GlobalPropertyId
 ,CASE WHEN(DP.Condition LIKE '' OR DP.Condition LIKE 'N/A') THEN 1 ELSE 0 END AS Condition_unknown
 
 --Occupancy dummies require cases too
-
 ,CASE WHEN(DP.PropertyOccupancyStatus LIKE 'Occupied') THEN 1 ELSE 0 END AS PropertyOccupancyStatus_Occupied
 ,CASE WHEN(DP.PropertyOccupancyStatus LIKE '' OR DP.PropertyOccupancyStatus LIKE 'N/A') THEN 1 ELSE 0 END AS PropertyOccupancyStatus_Unknown
 ,CASE WHEN(DP.PropertyOccupancyStatus LIKE 'Vacant') THEN 1 ELSE 0 END AS PropertyOccupancyStatus_Vacant
@@ -260,7 +331,7 @@ DP.GlobalPropertyId
 
 
 --Web Traffic Metrics
-,ISNULL(TempF.Favorites,0) / (CASE WHEN(HIST.RunNum = 0 OR HIST.RunNum IS NULL) THEN 1 ELSE HIST.RunNum END) AS Favorites
+,ISNULL(TempF.Favorites,0) AS Favorites
 
 --Zillow-Based Metrics
 ,COALESCE(Appreciation, CountyAppreciation, StateAppreciation, NationalAppreciation ) AS Appreciation
@@ -282,9 +353,6 @@ DP.GlobalPropertyId
 ,FTA.OpeningBid
 ,COUNT(DA.AuctionCode) OVER(PARTITION BY DA.AuctionCode) AS EventSize
 ,COUNT(DA.AuctionCode) OVER(PARTITION BY DA.AuctionCode, DP.PropertyState) AS StateEventSize
---,CASE WHEN(ZSG.DeedType = 'Full Warranty') THEN 1 ELSE 0 END AS FullWarrantyDeed
---,CASE WHEN(ZSG.DeedType = 'Special Warranty') THEN 1 ELSE 0 END AS SpecialWarrantyDeed
---,CASE WHEN(ZSG.DeedType = 'Quit Claim') THEN 1 ELSE 0 END AS QuitClaimDeed
 ,ISNULL(AE.AvgSTR, 0) AS ADC_Historical_Execution
 ,ISNULL(PQ.AvgSTR,0) AS SellerPortfolioQuality
 ,FTA.IsAuction
@@ -303,7 +371,7 @@ LEFT JOIN	EDW.dbo.DimAuction								DA	ON( DA.AuctionId = FTA.AuctionId)
 LEFT JOIN	EDW.dbo.DimAuctionStatus						DAS	ON(DAS.AuctionStatusId = FTA.AuctionStatusId)
 LEFT JOIN	EDW.dbo.DimGeo_New									DG	ON(DG.GeoId = FTA.GeoId)
 LEFT JOIN	EDW.dbo.DimTrustee								DT	ON(DT.TrusteeId = FTA.TrusteeId)
-LEFT JOIN	#Favorites										TempF ON(FTA.PropertyId = TempF.PropertyId)
+LEFT JOIN	#Favorites										TempF ON(FTA.PropertyId = TempF.PropertyId AND FTA.AuctionId = TempF.AuctionId)
 LEFT JOIN	PredictiveData.dbo.InterpolatedZillowMetrics	F	ON(DP.PropertyZip = F.PropertyZip AND Date = FTA.ZillowJoinField)
 LEFT JOIN	PredictiveData.dbo.USPS_Vacancy					USPS  ON(DP.PropertyZip = USPS.ZIP AND USPS.Date = FTA.USPSJoinField)
 LEFT JOIN	#ADCExecution									AE ON(DP.PropertyZip = AE.PropertyZip)
@@ -323,7 +391,13 @@ CREATE NONCLUSTERED INDEX PropertyState ON #TrusteePredictionSourceTable (Proper
 
 
 
---Create a Fault Suggestor For This Set
+        PropertyFaultSuggestor:
+--========================================================================================================================
+-- Create a Fault Suggestor For This Set
+-- Using the weights we used to create the predictions themselves, we rank the weighted contribution of each attribute for each property
+-- We sort them from smallest to largest and return the 2 smallest (should be a negative number
+-- We restrict the output so that "Reserve" itself is never the problem suggested, as this is not a useful output
+--========================================================================================================================
 SELECT
   GlobalPropertyId
   ,PropertyId
@@ -333,8 +407,8 @@ SELECT
   ,PropertyFaultName
   ,[Value] *CASE	WHEN(	NEG.PropertyFaultVariable = 'ADC_Historical_Execution') THEN FA.ADC_Historical_Execution
 					WHEN(	NEG.PropertyFaultVariable = 'Appreciation') THEN FA.Appreciation
-					WHEN(	NEG.PropertyFaultVariable = 'BPOSurplus') THEN (COALESCE(FA.BPO, 1.2*FA.Reserve) - FA.Reserve)
-					WHEN(	NEG.PropertyFaultVariable = 'BPOSurplusPct') THEN ((COALESCE(FA.BPO, 1.2*FA.Reserve) - FA.Reserve) / FA.Reserve)
+					WHEN(	NEG.PropertyFaultVariable = 'BPOSurplus') THEN (COALESCE(FA.BPO, @BPOReserveRatio*FA.Reserve) - FA.Reserve)
+					WHEN(	NEG.PropertyFaultVariable = 'BPOSurplusPct') THEN ((COALESCE(FA.BPO, @BPOReserveRatio*FA.Reserve) - FA.Reserve) / FA.Reserve)
 					WHEN(	NEG.PropertyFaultVariable = 'C2C_Flag') THEN FA.C2C_Flag
 					WHEN(	NEG.PropertyFaultVariable = 'Cancellations') THEN FA.Cancellations
 					WHEN(	NEG.PropertyFaultVariable = 'Condition_average') THEN FA.Condition_average
@@ -402,15 +476,14 @@ AND PropertyFaultVariable != 'Intercept'
 AND PropertyFaultVariable != 'Reserve') T1
 WHERE RowId = 1 or RowId = 2
 
-
-
+        PredictionCalculationTable:
+--========================================================================================================================
 -- For Each Global Property ID, perform:
 -- P(AuctionDaySale) = 1 / (1 + EXP((-1)*(Beta0 + BETA_Vector*X_Matrix)) -- Logistic
 -- P(SellerAcceptedSale) = 1 / (1 + EXP((-1)*(Beta0 + BETA_Vector*X_Matrix)) -- Logistic
 -- P(ExceedReserve) = 1 / (1 + EXP((-1)*(Beta0 + BETA_Vector*X_Matrix)) -- Logistic
 -- Likely High Bid = Suggested Reserve Maximum = Beta0 + BETA_Vector*X_Matrix -- Linear
-
-
+--========================================================================================================================
 SELECT
 --Build Descriptive Information
 A.GlobalPropertyId
@@ -454,7 +527,7 @@ A.GlobalPropertyId
 ,A.OpeningBid
 ,A.Reserve
 ,A.BPO
-,CASE WHEN(A.BPO < 0.1 * A.Reserve OR A.BPO IS NULL) THEN 1.2*A.Reserve ELSE A.BPO END AS FunctionalBPO
+,CASE WHEN(A.BPO < 0.1 * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveRatio*A.Reserve ELSE A.BPO END AS FunctionalBPO
 ,A.HighBid
 ,A.IsCancelled
 ,A.IsPostponed
@@ -467,8 +540,8 @@ A.GlobalPropertyId
 B.Intercept +
 A.ADC_Historical_Execution * B.ADC_Historical_Execution +
 A.Appreciation * B.Appreciation +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 1.2*A.Reserve ELSE A.BPOSurplus END) * B.BPOSurplus +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 0.2 ELSE A.BPOSurplusPct END) * B.BPOSurplusPct +
+(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveRatio*A.Reserve ELSE A.BPOSurplus END) * B.BPOSurplus +
+(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveSurplusDefault ELSE A.BPOSurplusPct END) * B.BPOSurplusPct +
 A.C2C_Flag * B.C2C_Flag +
 A.Cancellations * B.Cancellations +
 A.Condition_poor * B.Condition_poor +
@@ -494,8 +567,8 @@ A.RunNum * B.RunNum +
 A.SellerPortfolioQuality * B.SellerPortfolioQuality +
 A.SFR_Flag * B.SFR_Flag +
 A.ShortSale_Flag * B.ShortSale_Flag + 
-ISNULL(A.TotalActive, 8000) * B.TotalActive +
-CAST(ISNULL(A.Vacancy,0.087) AS Decimal) * B.Vacancy +
+ISNULL(A.TotalActive, @ZIPPopulationDefault) * B.TotalActive +
+CAST(ISNULL(A.Vacancy,@ZIPVacancyRateDefault) AS Decimal) * B.Vacancy +
 A.ValueLevel_Low * B.ValueLevel_Low +
 A.ValueLevel_Med * B.ValueLevel_Med +
 A.ValueLevel_High * B.ValueLevel_High
@@ -507,8 +580,8 @@ A.ValueLevel_High * B.ValueLevel_High
 C.Intercept +
 A.ADC_Historical_Execution * C.ADC_Historical_Execution +
 A.Appreciation * C.Appreciation +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 1.2*A.Reserve ELSE A.BPOSurplus END) * C.BPOSurplus +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 0.2 ELSE A.BPOSurplusPct END) * C.BPOSurplusPct +
+(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveRatio*A.Reserve ELSE A.BPOSurplus END) * C.BPOSurplus +
+(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveSurplusDefault ELSE A.BPOSurplusPct END) * C.BPOSurplusPct +
 A.C2C_Flag * C.C2C_Flag +
 A.Cancellations * C.Cancellations +
 A.Condition_poor * C.Condition_poor +
@@ -534,8 +607,8 @@ A.RunNum * C.RunNum +
 A.SellerPortfolioQuality * C.SellerPortfolioQuality +
 A.SFR_Flag * C.SFR_Flag +
 A.ShortSale_Flag * C.ShortSale_Flag + 
-ISNULL(A.TotalActive, 8000) * C.TotalActive +
-CAST(ISNULL(A.Vacancy,0.087) AS Decimal) * C.Vacancy +
+ISNULL(A.TotalActive, @ZIPPopulationDefault) * C.TotalActive +
+CAST(ISNULL(A.Vacancy,@ZIPVacancyRateDefault) AS Decimal) * C.Vacancy +
 A.ValueLevel_Low * C.ValueLevel_Low +
 A.ValueLevel_Med * C.ValueLevel_Med +
 A.ValueLevel_High * C.ValueLevel_High
@@ -547,8 +620,8 @@ A.ValueLevel_High * C.ValueLevel_High
 D.Intercept +
 A.ADC_Historical_Execution * D.ADC_Historical_Execution +
 A.Appreciation * D.Appreciation +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 1.2*A.Reserve ELSE A.BPOSurplus END) * D.BPOSurplus +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 0.2 ELSE A.BPOSurplusPct END) * D.BPOSurplusPct +
+(CASE WHEN(A.BPO < @BPOAbsurdityLowerBound * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveRatio*A.Reserve ELSE A.BPOSurplus END) * D.BPOSurplus +
+(CASE WHEN(A.BPO < @BPOAbsurdityLowerBound * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveSurplusDefault ELSE A.BPOSurplusPct END) * D.BPOSurplusPct +
 A.C2C_Flag * D.C2C_Flag +
 A.Cancellations * D.Cancellations +
 A.Condition_poor * D.Condition_poor +
@@ -574,8 +647,8 @@ A.RunNum * D.RunNum +
 A.SellerPortfolioQuality * D.SellerPortfolioQuality +
 A.SFR_Flag * D.SFR_Flag +
 A.ShortSale_Flag * D.ShortSale_Flag + 
-ISNULL(A.TotalActive, 8000) * D.TotalActive +
-CAST(ISNULL(A.Vacancy,0.087) AS Decimal) * D.Vacancy +
+ISNULL(A.TotalActive, @ZIPPopulationDefault) * D.TotalActive +
+CAST(ISNULL(A.Vacancy,@ZIPVacancyRateDefault) AS Decimal) * D.Vacancy +
 A.ValueLevel_Low * D.ValueLevel_Low +
 A.ValueLevel_Med * D.ValueLevel_Med +
 A.ValueLevel_High * D.ValueLevel_High
@@ -587,8 +660,8 @@ A.ValueLevel_High * D.ValueLevel_High
 E.Intercept +
 A.ADC_Historical_Execution * E.ADC_Historical_Execution +
 A.Appreciation * E.Appreciation +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 1.2*A.Reserve ELSE A.BPOSurplus END) * E.BPOSurplus +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 0.2 ELSE A.BPOSurplusPct END) * E.BPOSurplusPct +
+(CASE WHEN(A.BPO < @BPOAbsurdityLowerBound * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveRatio*A.Reserve ELSE A.BPOSurplus END) * E.BPOSurplus +
+(CASE WHEN(A.BPO < @BPOAbsurdityLowerBound * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveSurplusDefault ELSE A.BPOSurplusPct END) * E.BPOSurplusPct +
 A.C2C_Flag * E.C2C_Flag +
 A.Cancellations * E.Cancellations +
 A.Condition_poor * E.Condition_poor +
@@ -614,8 +687,8 @@ A.RunNum * E.RunNum +
 A.SellerPortfolioQuality * E.SellerPortfolioQuality +
 A.SFR_Flag * E.SFR_Flag +
 A.ShortSale_Flag * E.ShortSale_Flag + 
-ISNULL(A.TotalActive, 8000) * E.TotalActive +
-CAST(ISNULL(A.Vacancy,0.087) AS Decimal) * E.Vacancy +
+ISNULL(A.TotalActive, @ZIPPopulationDefault) * E.TotalActive +
+CAST(ISNULL(A.Vacancy,@ZIPVacancyRateDefault) AS Decimal) * E.Vacancy +
 A.ValueLevel_Low * E.ValueLevel_Low +
 A.ValueLevel_Med * E.ValueLevel_Med +
 A.ValueLevel_High * E.ValueLevel_High
@@ -627,9 +700,9 @@ A.ValueLevel_High * E.ValueLevel_High
 F.Intercept +
 A.ADC_Historical_Execution * F.ADC_Historical_Execution +
 A.Appreciation * F.Appreciation +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 1.2*A.Reserve ELSE A.BPO END) * F.BPO +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 1.2*A.Reserve ELSE A.BPOSurplus END) * F.BPOSurplus +
-(CASE WHEN(A.BPO < 0.15 * A.Reserve OR A.BPO IS NULL) THEN 0.2 ELSE A.BPOSurplusPct END) * F.BPOSurplusPct +
+(CASE WHEN(A.BPO < @BPOAbsurdityLowerBound * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveRatio*A.Reserve ELSE A.BPO END) * F.BPO +
+(CASE WHEN(A.BPO < @BPOAbsurdityLowerBound * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveRatio*A.Reserve ELSE A.BPOSurplus END) * F.BPOSurplus +
+(CASE WHEN(A.BPO < @BPOAbsurdityLowerBound * A.Reserve OR A.BPO IS NULL) THEN @BPOReserveSurplusDefault ELSE A.BPOSurplusPct END) * F.BPOSurplusPct +
 A.C2C_Flag * F.C2C_Flag +
 A.Cancellations * F.Cancellations +
 A.Condition_poor * F.Condition_poor +
@@ -654,8 +727,8 @@ A.RunNum * F.RunNum +
 A.SellerPortfolioQuality * F.SellerPortfolioQuality +
 A.SFR_Flag * F.SFR_Flag +
 A.ShortSale_Flag * F.ShortSale_Flag + 
-ISNULL(A.TotalActive, 8000) * F.TotalActive +
-CAST(ISNULL(A.Vacancy,0.087) AS Decimal) * F.Vacancy +
+ISNULL(A.TotalActive, @ZIPPopulationDefault) * F.TotalActive +
+CAST(ISNULL(A.Vacancy,@ZIPVacancyRateDefault) AS Decimal) * F.Vacancy +
 A.Trustee_Flag * F.Trustee_Flag +
 A.ValueLevel_Low * F.ValueLevel_Low +
 A.ValueLevel_Med * F.ValueLevel_Med +
@@ -764,8 +837,12 @@ AuctionDate
 ,AuctionCode
 ,GlobalPropertyId;
 
---Put the Prediction Table into it's two destination tables, one with all historical info, another with only the most recent data
 
+        PublishingResults:
+--========================================================================================================================
+-- Publishing Results into their Final Tables
+-- Put the Prediction Table into it's two destination tables, one with all historical info, another with only the most recent data
+--========================================================================================================================
 
 --Update existing historical record to show that previous data is now not the most recent:
 UPDATE PredictiveData.dbo.TrusteePredictionOutput_Auto
@@ -780,18 +857,47 @@ DROP TABLE PredictiveData.dbo.MostRecentTrusteePredictionOutput_Auto;
 SELECT * INTO PredictiveData.dbo.MostRecentTrusteePredictionOutput_Auto
 FROM #TrusteePredictionOutput_Auto;
 
-DROP TABLE #TemporaryFactTrusteeAuction;
-DROP TABLE #BroughtToSaleHistory
-DROP TABLE #Favorites;
-DROP TABLE #ADCExecution;
-DROP TABLE #TrusteePortfolioQuality;
-DROP TABLE #TrusteePredictionPreOutput;
-DROP TABLE #TrusteePredictionSourceTable;
-DROP TABLE #TrusteePredictionOutput_Auto;
-DROP TABLE #TrusteeNegativeFactors;
-DROP TABLE #TrusteePropertyFaultPreOutput;
-
-
+        DropTables:
+        IF OBJECT_ID('tempdb..#TemporaryFactTrusteeAuction') IS NOT NULL
+            BEGIN
+                DROP TABLE #TemporaryFactTrusteeAuction
+            END
+        IF OBJECT_ID('tempdb..#BroughtToSaleHistory') IS NOT NULL
+            BEGIN
+                DROP TABLE #BroughtToSaleHistory;
+            END
+        IF OBJECT_ID('tempdb..#Favorites') IS NOT NULL
+            BEGIN
+                DROP TABLE #Favorites;
+            END
+        IF OBJECT_ID('tempdb..#ADCExecution') IS NOT NULL
+            BEGIN
+                DROP TABLE #ADCExecution;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePortfolioQuality') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePortfolioQuality;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePredictionPreOutput') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePredictionPreOutput;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePredictionSourceTable') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePredictionSourceTable;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePredictionOutput_Auto') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePredictionOutput_Auto;
+            END
+        IF OBJECT_ID('tempdb..#TrusteeNegativeFactors') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteeNegativeFactors;
+            END
+        IF OBJECT_ID('tempdb..#TrusteePropertyFaultPreOutput') IS NOT NULL
+            BEGIN
+                DROP TABLE #TrusteePropertyFaultPreOutput;
+            END
 
 END
 
@@ -800,5 +906,7 @@ DROP PROCEDURE DataScience_TrusteePredictionData
 
 DROP TABLE PredictiveData.dbo.TrusteePredictionOutput_Auto
 
-SELECT TOP 2000 * FROM PredictiveData.dbo.TrusteePredictionOutput_Auto WHERE MostRecentData = 1
+SELECT * FROM PredictiveData.dbo.TrusteePredictionOutput_Auto WHERE MostRecentData = 1
 */
+
+GO
